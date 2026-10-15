@@ -1,0 +1,88 @@
+# Sentinel SOC Lab: attack simulation helpers.
+# RUN INSIDE THE LAB VM AS ADMINISTRATOR. Use only on a test machine you own and control.
+#
+# Usage:
+#   .\attack-sim.ps1 -Technique BruteForce
+#   .\attack-sim.ps1 -Technique LocalAdmin
+#   .\attack-sim.ps1 -Technique LocalAdmin -Cleanup
+
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("BruteForce", "LocalAdmin")]
+    [string]$Technique,
+    [switch]$Cleanup
+)
+
+switch ($Technique) {
+
+    "BruteForce" {
+        # MITRE T1110: eight failed network logons for an account that does not exist.
+        # Each failure is logged by Windows as event 4625.
+        1..8 | ForEach-Object { net use \\localhost\IPC$ /user:labfake "WrongPass$_" }
+        Write-Host "Done. Wait 5-10 minutes, then check Incidents."
+        Write-Host "If an earlier brute-force incident is still open, close it first so a new one is created."
+    }
+
+    "LocalAdmin" {
+        # MITRE T1136.001: create a local account and add it to Administrators.
+        # Windows logs event 4720 (account created) and 4732 (member added to a local group).
+        if ($Cleanup) {
+            net user labtemp /delete
+            net user
+        }
+        else {
+            $pw = Read-Host "Enter a throwaway test password for the labtemp account"
+            net user labtemp $pw /add
+            net localgroup administrators labtemp /add
+            Write-Host "Done. Run again with -Cleanup after you have taken your screenshots."
+        }
+    }
+}
+#!/usr/bin/env bash
+# Sentinel SOC Lab control (Azure CLI). Requires: az login, correct subscription selected.
+# Usage: ./lab-control.sh {start|stop|status|myip|query "<KQL>"}
+
+set -euo pipefail
+
+VM_RG="SC-200"
+VM_NAME="SC200-WS22"
+SOC_RG="Rg-soc-lab"
+WORKSPACE="law-soc-lab"
+NSG_NAME="SC200-WS22-nsg"
+NSG_RULE="Allow-RDP-MyIP"
+
+case "${1:-}" in
+  start)
+    az vm start -g "$VM_RG" -n "$VM_NAME"
+    az vm show -d -g "$VM_RG" -n "$VM_NAME" --query "{state:powerState, ip:publicIps}" -o table
+    ;;
+  stop)
+    # Deallocate (not just stop) so compute billing ends. Auto-shutdown is unavailable in this region.
+    az vm deallocate -g "$VM_RG" -n "$VM_NAME"
+    az vm get-instance-view -g "$VM_RG" -n "$VM_NAME" \
+      --query "instanceView.statuses[?starts_with(code,'PowerState')].displayStatus" -o tsv
+    ;;
+  status)
+    az vm get-instance-view -g "$VM_RG" -n "$VM_NAME" \
+      --query "instanceView.statuses[?starts_with(code,'PowerState')].displayStatus" -o tsv
+    ;;
+  myip)
+    # Updates the RDP rule to your current public IP (home IP changes).
+    MYIP="$(curl -s https://api.ipify.org)"
+    echo "Current public IP: $MYIP"
+    az network nsg rule update -g "$VM_RG" --nsg-name "$NSG_NAME" -n "$NSG_RULE" \
+      --source-address-prefixes "${MYIP}/32" \
+      --query "{rule:name, source:sourceAddressPrefix, port:destinationPortRange, access:access}" -o table
+    ;;
+  query)
+    # Runs a KQL query against the Sentinel workspace (Log Analytics tables only, e.g. SecurityEvent).
+    # Defender Device* tables are queried in the Defender portal Advanced hunting, not here.
+    : "${2:?Provide a KQL query string}"
+    WS_ID="$(az monitor log-analytics workspace show -g "$SOC_RG" -n "$WORKSPACE" --query customerId -o tsv)"
+    az monitor log-analytics query -w "$WS_ID" --analytics-query "$2" -o table
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|status|myip|query \"<KQL>\"}"
+    exit 1
+    ;;
+esac
